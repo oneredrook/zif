@@ -77,9 +77,9 @@ else
 
 sub processOptions
 {
-my ($foo);
+my ($opt_status);
 
-$foo = getopts('hHvlo:', $OPTIONS);
+$opt_status = getopts('hHvlo:', $OPTIONS);
 
 $OPTIONS->{filter} = [ @ARGV ];
 
@@ -120,7 +120,7 @@ while (<IFCONFIG>)
       sflags    => $3,
       };
 
-    # Make a hash from the flag names, key = flag name, value = 1)
+    # Make a hash from the flag names, key = lower case flag name, value = flag name)
     $int->{symbolic_flags} = { map {lc $_ => $_} (split(',', $3)) };
 
     # Extend the hash with the remainder of the interface definition
