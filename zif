@@ -1,0 +1,421 @@
+#!/usr/bin/env perl -w
+
+use Getopt::Std;
+use strict;
+
+
+$, = ' ';
+
+my ($OPTIONS);
+my ($INTERFACES);
+my ($INTS_BY_ZONE);
+my (%NM2CIDR);
+my ($SCRIPTNAME);
+my (%ALIASES, %ALIAS_MAP, $ALIAS);
+
+# Disk space is cheap
+%NM2CIDR = (
+  '4294967295' => 32, '4294967294' => 31, '4294967292' => 30, '4294967288' => 29,
+  '4294967280' => 28, '4294967264' => 27, '4294967232' => 26, '4294967168' => 25,
+  '4294967040' => 24, '4294966784' => 23, '4294966272' => 22, '4294965248' => 21,
+  '4294963200' => 20, '4294959104' => 19, '4294950912' => 18, '4294934528' => 17,
+  '4294901760' => 16, '4294836224' => 15, '4294705152' => 14, '4294443008' => 13,
+  '4293918720' => 12, '4292870144' => 11, '4290772992' => 10, '4286578688' => 9,
+  '4278190080' => 8, '4261412864' => 7, '4227858432' => 6, '4160749568' => 5,
+  '4026531840' => 4, '3758096384' => 3, '3221225472' => 2, '2147483648' => 1,
+  '0' => 0,
+  );
+
+# Some information returned by ifconfig has a non-obvious name (cf 'inet'
+# vs 'ip'). Define some aliases for convenience. Aliases can be used both
+# in expressions and output formats.
+% ALIASES = (
+  inet       => [ 'ip' ],
+  interface  => [ 'int', 'name' ],
+  broadcast  => [ 'bc' ],
+  network    => [ 'nw' ],
+  zone       => [ 'zonename' ],
+  groupname  => [ 'ipmp', 'group' ],
+  );
+
+%ALIAS_MAP = ();
+foreach $ALIAS (keys %ALIASES)
+  { %ALIAS_MAP = ( %ALIAS_MAP, map { $_ => $ALIAS } @{ $ALIASES{$ALIAS} } ) }
+
+# Basename
+($SCRIPTNAME = $0) =~ s{^(.*/)?(.+)$}{$2};
+
+# Options
+$OPTIONS = {};
+processOptions();
+
+$INTERFACES = getIfData();
+
+if ($OPTIONS->{o})
+  { longOutput($INTERFACES); }
+
+else
+  {
+  $INTS_BY_ZONE = {};
+
+  # Select by zone: hash key = zone name, value = list of refs to interface data
+  foreach (@{$INTERFACES})
+    { push @{$INTS_BY_ZONE->{$_->{zone}}}, $_; }
+
+  # Output global zone, then sort non-global zones alphabetically
+  summarizeZone('global', $INTS_BY_ZONE->{global});
+  foreach (sort keys %{$INTS_BY_ZONE})
+    {
+    next if ($_ eq 'global');
+    summarizeZone($_, $INTS_BY_ZONE->{$_});
+    }
+  }
+
+##
+##
+##
+
+sub processOptions
+{
+my ($foo);
+
+$foo = getopts('hHvlo:', $OPTIONS);
+
+$OPTIONS->{filter} = [ @ARGV ];
+
+if ($OPTIONS->{h} or $OPTIONS->{H})
+  {
+  help();
+  exit(0);
+  }
+
+if ($OPTIONS->{l})
+  { push @{$OPTIONS->{filter}}, 'noflag=loopback' }
+  
+if ($OPTIONS->{v} and not $OPTIONS->{o})
+  { $OPTIONS->{o} = 'zone,interface,ip,nmask' }
+  
+}
+
+sub getIfData
+{
+my (@interfaces, $int);
+
+open IFCONFIG, 'ifconfig -a |'
+  or die "$SCRIPTNAME: could not read from ifconfig";
+
+@interfaces = ();
+while (<IFCONFIG>)
+  {
+  chomp();
+
+  # The start of an interface looks like this:
+  # lo0: flags=1000849<UP,LOOPBACK,RUNNING,MULTICAST,IPv4> mtu 8232 index 1
+  if (/^([\w:]+):\s+flags=(\d+)<([^>]+)> (.*)/)
+    {
+    $int = {
+      interface => $1,
+      flags     => $2,
+      zone      => 'global',     # default value
+      sflags    => $3,
+      };
+
+    # Make a hash from the flag names, key = flag name, value = 1)
+    $int->{symbolic_flags} = { map {lc $_ => $_} (split(',', $3)) };
+
+    # Extend the hash with the remainder of the interface definition
+    $int = { %{$int}, split /\s+/, $4};
+
+    push @interfaces, $int;
+    }
+
+  else
+    {
+    if (not @interfaces)
+      { die "$SCRIPTNAME: Could not parse ifconfig output" }
+
+    # Current interface definition
+    $int = pop @interfaces;
+
+    # IPv4 address information
+    if (/^\s+inet\b/)
+      {
+      # Extend the hash with the key/value pairs on the "inet" line
+      $int = { %{$int}, split };
+
+      # Convert IP address data to integer format
+      $int->{_in_ip} = ip_dq2in($int->{inet});    # IP address
+      $int->{_in_nm} = hex($int->{netmask});      # Netmask
+      $int->{_in_hm} = repack(~$int->{_in_nm});   # Hostmask
+      $int->{_in_nw} = $int->{_in_ip} & $int->{_in_nm};   # Network address
+      $int->{_in_bc} = $int->{_in_ip} | $int->{_in_hm};   # Broadcast address
+
+      # Simple text representations
+      $int->{cidr}   = '/' . $NM2CIDR{$int->{_in_nm}};
+      $int->{ipcidr} = $int->{inet} . $int->{cidr};
+      $int->{nmask} = ip_in2dq($int->{_in_nm});
+      $int->{broadcast} = ip_in2dq($int->{_in_bc});
+      $int->{network}   = ip_in2dq($int->{_in_nw});
+      }
+
+    # MAC address
+    elsif (/^\s+ether\s+(.*)/)
+      { $int->{ether} = $1; }
+
+    # Zone name
+    elsif (/^\s+zone\s+(.*)/)
+      { $int->{zone} = $1; }
+
+    # IPMP
+    elsif (/^\s+groupname\s+(.*)/)
+      { $int->{groupname} = $1; }
+
+    # Largely ignore IPv6
+    elsif ( /^\s+inet6\s+(.*)/)
+      { $int->{inet6} = $int->{ipcidr} = $int->{inet} = $1; }
+
+    # Fail unhandled input
+    else
+      { die "$SCRIPTNAME: unknown item:\n  $_"; }
+
+    push @interfaces, $int;
+    }
+  }
+
+close(IFCONFIG);
+return \@interfaces;
+}
+
+
+sub longOutput
+{
+my ($interfaces) = shift;
+my (%col_defs);
+my (@print_values,  @print_cols, @hdr);
+my ($def_field, $pic, $int);
+
+%col_defs = (
+  interface  => '>>>>>>>>>>>>>',
+  inet       => '>>>>>>>>>>>>>>>',
+  broadcast  => '>>>>>>>>>>>>>>>',
+  network    => '>>>>>>>>>>>>>>>',
+  nmask      => '>>>>>>>>>>>>>>>',
+  ipcidr     => '>>>>>>>>>>>>>>>>>>',
+  netmask    => '>>>>>>>>',
+  mtu        => '>>>>>',
+  index      => '>>',
+  zone       => '>>>>>>>>>>>>>',
+  ether      => '>>>>>>>>>>>>>>>>>',
+  groupname  => '>>>>>>>>>>>>',
+  cidr       => '<<<<',
+  );
+
+$def_field = '*';
+
+@print_cols = split /,/, $OPTIONS->{o};
+@hdr = ();
+$pic = "";
+
+# Using perl's "formats", create the picture line and the headings.
+# formline stores the output in the special variable $^A
+foreach (@print_cols)
+  {
+  # Convert aliases to canonical form
+  $_ = lc $_;
+  $_ = exists $ALIAS_MAP{$_} ? $ALIAS_MAP{$_} : $_ ;
+
+  $pic .= '@' . ($col_defs{$_} ? $col_defs{$_} : $def_field) . " ";
+  push @hdr, uc $_;
+  }
+$pic .= "\n";
+formline $pic, @hdr;
+
+# Print out the columns given on the command line for each interface. Use an
+# empty string whenever an interface doesn't have that particular field
+foreach $int (@{$interfaces})
+  {
+  next unless filter_pass($int);
+  @print_values = ( map {exists $int->{$_} ? $int->{$_} : ""} @print_cols );
+  formline $pic, @print_values;
+  }
+
+# Print out the format we've created
+print $^A;
+
+}
+
+
+sub summarizeZone
+{
+my ($zone_name, $zone_ints) = @_;
+my ($int, @fltr_ints);
+
+# Sort by interface index, filter out unwanted interfaces
+foreach $int (sort { $a->{index} <=> $b->{index} } @{$zone_ints} )
+  {
+  next unless filter_pass($int);
+  push @fltr_ints, $int;
+  }
+
+if (@fltr_ints)
+  {
+  print "$zone_name\n";
+  foreach $int (@fltr_ints)
+    { formatInt($int->{interface}, $int->{ipcidr}, $int->{groupname}) }
+  }
+}
+
+
+sub formatInt
+{
+my ($int, $ip, $group) = @_;
+my ($text_group) = $group ? "ipmp:$group" : "";
+
+format =
+    @<<<<<<<<<<<< @<<<<<<<<<<<<<<<<<< @<<<<<<<<<<
+    $int,         $ip,                $text_group
+.
+write;
+}
+
+
+# Sometimes we need to ensure we have a 32 bit integer - some bitwise operations
+# (notably bitwise complement) convert to the largest type available
+sub repack
+{ return unpack("N", pack("N", shift)) }
+
+
+# Convert dotted quad notation (127.0.0.1) to an integer
+sub ip_dq2in
+{ return unpack("N", pack("CCCC", split(/\./, shift))) }
+
+
+# Convert an interger to dotted quad notation
+sub ip_in2dq
+{ return join(".", unpack("CCCC", pack("N", repack(shift)))) }
+
+
+# Return true or false based on user-supplied expression
+sub filter_pass
+{
+my ($int) = shift;
+my ($pass, $negate, $hostmask, $test, $value);
+
+# filter arguments are optional, so assume the interface passes and only
+# disqualify if we find otherwise. Values for $pass are 1 (success) or
+# -1 (fail).
+$pass = 1;
+
+foreach (@{$OPTIONS->{filter}})
+  {
+
+  # In general, expressions should have the form "foo=bar", where foo
+  # can be any key we've extracted out of the ifconfig output, or a
+  # specific test. If an expression is just a single word - eg. "baz",
+  # the test is assumed to be "zone=baz".
+  if (/([^=]+)=(.*)/)
+    { $test = $1; $value = $2; }
+  else
+    { $test = 'zone'; $value = $_; }
+
+  # Convert to canonical form
+  $test = exists $ALIAS_MAP{$test} ? $ALIAS_MAP{$test} : $test;
+
+  # Any filter criteria can have "no" prepended to reverse the result of
+  # the test. Test, and strip "no" from the test name
+  if ($test =~ s/^no//)
+    { $negate = -1 }
+  else
+    { $negate =  1 }
+
+  # Filter on symbolic flags
+  if ($test eq 'flag')
+    { $pass = ($int->{symbolic_flags}{"\L$value"} ? 1 : -1) }
+
+  # Mini subnet calculator - work out the network and broadcast address
+  # from the user-supplied range as integers, and then compare to the
+  # interface IP address. The range should be in the form 1.2.3.4/16; the CIDR
+  # notation is ooptional, and defaults to /24
+  elsif ($test eq 'subnet' and $int->{symbolic_flags}{ipv4})
+    {
+    if ($value =~ m{([\d.]+)(/(\d+))?})
+      {
+      $hostmask = (1 << ($3 ? 32 - $3 : 8)) - 1;
+      $pass = ($int->{_in_ip} >= (ip_dq2in($1) & repack(~$hostmask)) &&  # Network address
+               $int->{_in_ip} <= (ip_dq2in($1) | $hostmask)              # Broadcast address
+                 ?  1     # Pass
+                 : -1);   # Fail
+      }
+    }
+  
+  # Filter on text parsed from ifconfig -a command
+  else
+    { $pass = (exists $int->{$test} and $int->{$test} eq $value) ? 1 : -1  }
+
+  $pass *= $negate;
+
+  # Bail out on the first failed test, so that the correct result
+  # is return()ed from the function
+  last if ($pass < 0);
+  }
+
+return $pass > 0;
+}
+
+sub help
+{
+print <<EOHelpShort;
+$SCRIPTNAME [OPTIONS] [ expression expression ... ] 
+Prints a summary of "ifconfig -a" output.
+  -h		Prints this message
+  -H		Longer help info (output formats, expressions)
+  -l		Ignore loopback interfaces
+  -o format	Output format options
+  -v		Equivalent to "-o zone,interface,ip,nmask"
+
+EOHelpShort
+
+# Extended help
+if ($OPTIONS->{H})
+  {
+  print <<EOHelpLong;
+OUTPUT FORMATS
+An output format is a comma-separated list of items. Any item found in an interface
+descriptions, such as "inet" or "mtu", can be used. A number of convenient aliases
+can also be used, these aliases are also valid in EXPRESSIONS below:
+
+  ip:		inet
+  int:		interface
+  nmask:	netmask in dotted quad notation
+  ipcidr:	IP address in CIDR notation
+  sflags:	all the flags by name
+
+EXPRESSIONS
+An "expression" can be used to print out only specific interfaces. It can be:
+	test=value		# tests equality
+	notest=value		# negate test
+	value			# shorthand for "zone=value"
+
+where test is:
+	a) any item that can be found in the ifconfig description, eg -
+		$SCRIPTNAME groupname=ipmp_group_name
+		$SCRIPTNAME inet=1.2.3.4
+	b) "subnet" - selects interfaces within subnet
+		$SCRIPTNAME subnet=10.0.0.1/8
+		(CIDR netmask optional, defaults to /24)
+	c) "flag" - test for a specific flag by name
+		$SCRIPTNAME noflag=loopback
+
+All expressions are "AND"ed together.
+
+BUGS
+$SCRIPTNAME provides no sensible handling of IPv6 to speak of.
+
+EOHelpLong
+  }
+}
+
+# For Getopt::getopts
+*HELP_MESSAGE = \&help;
+
+# EOF
